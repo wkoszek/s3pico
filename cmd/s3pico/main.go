@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"s3pico/pkg/s3pico"
+	"github.com/wkoszek/s3pico/pkg/s3pico"
 )
 
 func main() {

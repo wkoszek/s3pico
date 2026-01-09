@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"s3pico/pkg/s3pico"
+	"github.com/wkoszek/s3pico/pkg/s3pico"
 )
 
 func newTestServer(t *testing.T) (*s3pico.Server, string, func()) {

@@ -12,7 +12,7 @@ import (
 	"sync"
 	"testing"
 
-	"s3pico/pkg/s3pico"
+	"github.com/wkoszek/s3pico/pkg/s3pico"
 )
 
 var (
