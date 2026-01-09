@@ -1510,3 +1510,125 @@ func BenchmarkConcurrentOperations(b *testing.B) {
 		}
 	})
 }
+
+func TestFolderOperations(t *testing.T) {
+	t.Parallel()
+	ts, dataDir, cleanup := newTestServerWithHTTP(t)
+	defer cleanup()
+
+	client := clientFromTestServer(ts)
+	bucket := "foldertest1"
+
+	t.Run("create folder with 3 files and delete all", func(t *testing.T) {
+		// Create bucket
+		if err := client.MakeBucket(bucket); err != nil {
+			t.Fatalf("Failed to create bucket: %v", err)
+		}
+
+		// Create folder with 3 files
+		folder := "myfolder"
+		files := []struct {
+			name    string
+			content string
+		}{
+			{"file1.txt", "content of file 1"},
+			{"file2.txt", "content of file 2"},
+			{"file3.txt", "content of file 3"},
+		}
+
+		// Upload all files
+		for _, f := range files {
+			remotePath := fmt.Sprintf("%s/%s/%s", bucket, folder, f.name)
+			if err := client.PutBytes([]byte(f.content), remotePath); err != nil {
+				t.Fatalf("Failed to upload %s: %v", f.name, err)
+			}
+		}
+
+		// Verify all files exist via Head
+		for _, f := range files {
+			remotePath := fmt.Sprintf("%s/%s/%s", bucket, folder, f.name)
+			info, err := client.Head(remotePath)
+			if err != nil {
+				t.Fatalf("Head failed for %s: %v", f.name, err)
+			}
+			if info.Size != int64(len(f.content)) {
+				t.Errorf("Size mismatch for %s: got %d, want %d", f.name, info.Size, len(f.content))
+			}
+		}
+
+		// Verify all files exist via Get
+		for _, f := range files {
+			remotePath := fmt.Sprintf("%s/%s/%s", bucket, folder, f.name)
+			data, err := client.Get(remotePath)
+			if err != nil {
+				t.Fatalf("Get failed for %s: %v", f.name, err)
+			}
+			if string(data) != f.content {
+				t.Errorf("Content mismatch for %s: got %q, want %q", f.name, string(data), f.content)
+			}
+		}
+
+		// List bucket and verify 3 files in folder
+		listed, err := client.List(bucket)
+		if err != nil {
+			t.Fatalf("List failed: %v", err)
+		}
+		folderFiles := 0
+		for _, f := range listed {
+			if strings.HasPrefix(f.Name, folder+"/") {
+				folderFiles++
+			}
+		}
+		if folderFiles != 3 {
+			t.Errorf("Expected 3 files in folder, got %d", folderFiles)
+		}
+
+		// Verify files exist on disk
+		for _, f := range files {
+			diskPath := filepath.Join(dataDir, bucket, folder, f.name)
+			if _, err := os.Stat(diskPath); os.IsNotExist(err) {
+				t.Errorf("File %s should exist on disk", f.name)
+			}
+		}
+
+		// Delete all files in folder
+		for _, f := range files {
+			remotePath := fmt.Sprintf("%s/%s/%s", bucket, folder, f.name)
+			if err := client.Delete(remotePath); err != nil {
+				t.Fatalf("Failed to delete %s: %v", f.name, err)
+			}
+		}
+
+		// Verify all files are gone via Head
+		for _, f := range files {
+			remotePath := fmt.Sprintf("%s/%s/%s", bucket, folder, f.name)
+			_, err := client.Head(remotePath)
+			if err == nil {
+				t.Errorf("File %s should be deleted", f.name)
+			}
+		}
+
+		// Verify files are gone from disk
+		for _, f := range files {
+			diskPath := filepath.Join(dataDir, bucket, folder, f.name)
+			if _, err := os.Stat(diskPath); !os.IsNotExist(err) {
+				t.Errorf("File %s should be deleted from disk", f.name)
+			}
+		}
+
+		// List bucket and verify folder is empty
+		listed, err = client.List(bucket)
+		if err != nil {
+			t.Fatalf("List failed: %v", err)
+		}
+		folderFiles = 0
+		for _, f := range listed {
+			if strings.HasPrefix(f.Name, folder+"/") {
+				folderFiles++
+			}
+		}
+		if folderFiles != 0 {
+			t.Errorf("Expected 0 files in folder after delete, got %d", folderFiles)
+		}
+	})
+}
