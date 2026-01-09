@@ -1,6 +1,6 @@
-# s3pico
+# s3pico - Minimal S3-compatible storage server in Go for testing
 
-Minimal S3-compatible storage server in Go.
+
 
 ## Usage
 
