@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,6 +14,13 @@ import (
 
 const DefaultPort = "8080"
 const DefaultHost = "localhost"
+
+// xmlEscape escapes special XML characters in a string
+func xmlEscape(s string) string {
+	var b strings.Builder
+	xml.EscapeText(&b, []byte(s))
+	return b.String()
+}
 
 type FileInfo struct {
 	Name    string    `json:"name"`
@@ -131,10 +139,22 @@ func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
 		subPath = parts[1]
 	}
 
-	projectDir := filepath.Join(s.config.DataDir, uuid)
-	fullPath := filepath.Join(projectDir, subPath)
+	// Clean the subPath to resolve any .. components
+	cleanSubPath := filepath.Clean(subPath)
+	// Reject if it tries to escape the bucket root
+	if cleanSubPath == ".." || strings.HasPrefix(cleanSubPath, ".."+string(filepath.Separator)) {
+		http.Error(wrappedWriter, "Invalid path", http.StatusBadRequest)
+		return
+	}
 
-	if !strings.HasPrefix(fullPath, projectDir) {
+	projectDir := filepath.Join(s.config.DataDir, uuid)
+	fullPath := filepath.Join(projectDir, cleanSubPath)
+
+	// Extra safety: verify the resolved path is within projectDir
+	// Clean both paths and use trailing separator to prevent prefix attacks (bucket vs bucket2)
+	cleanProjectDir := filepath.Clean(projectDir)
+	cleanFullPath := filepath.Clean(fullPath)
+	if cleanFullPath != cleanProjectDir && !strings.HasPrefix(cleanFullPath, cleanProjectDir+string(filepath.Separator)) {
 		http.Error(wrappedWriter, "Invalid path", http.StatusBadRequest)
 		return
 	}
@@ -224,7 +244,7 @@ func (s *Server) handleS3List(w http.ResponseWriter, r *http.Request, projectDir
 			return nil
 		}
 
-		if delimiter != "" && prefix != "" {
+		if delimiter != "" {
 			afterPrefix := strings.TrimPrefix(relPath, prefix)
 			if idx := strings.Index(afterPrefix, delimiter); idx >= 0 {
 				commonPrefix := prefix + afterPrefix[:idx+1]
@@ -253,14 +273,14 @@ func (s *Server) handleS3List(w http.ResponseWriter, r *http.Request, projectDir
 	w.Header().Set("Content-Type", "application/xml")
 	w.Write([]byte(`<?xml version="1.0" encoding="UTF-8"?>`))
 	w.Write([]byte(`<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">`))
-	w.Write([]byte(fmt.Sprintf(`<Name>%s</Name>`, strings.Trim(r.URL.Path, "/"))))
-	w.Write([]byte(fmt.Sprintf(`<Prefix>%s</Prefix>`, prefix)))
+	w.Write([]byte(fmt.Sprintf(`<Name>%s</Name>`, xmlEscape(strings.Trim(r.URL.Path, "/")))))
+	w.Write([]byte(fmt.Sprintf(`<Prefix>%s</Prefix>`, xmlEscape(prefix))))
 	w.Write([]byte(fmt.Sprintf(`<MaxKeys>%d</MaxKeys>`, 1000)))
 	w.Write([]byte(fmt.Sprintf(`<IsTruncated>%v</IsTruncated>`, false)))
 
 	for _, item := range contents {
 		w.Write([]byte(`<Contents>`))
-		w.Write([]byte(fmt.Sprintf(`<Key>%s</Key>`, item["Key"])))
+		w.Write([]byte(fmt.Sprintf(`<Key>%s</Key>`, xmlEscape(item["Key"].(string)))))
 		w.Write([]byte(fmt.Sprintf(`<LastModified>%s</LastModified>`, item["LastModified"])))
 		w.Write([]byte(fmt.Sprintf(`<Size>%d</Size>`, item["Size"])))
 		w.Write([]byte(fmt.Sprintf(`<StorageClass>%s</StorageClass>`, item["StorageClass"])))
@@ -269,7 +289,7 @@ func (s *Server) handleS3List(w http.ResponseWriter, r *http.Request, projectDir
 
 	for _, pfx := range commonPrefixes {
 		w.Write([]byte(`<CommonPrefixes>`))
-		w.Write([]byte(fmt.Sprintf(`<Prefix>%s</Prefix>`, pfx["Prefix"])))
+		w.Write([]byte(fmt.Sprintf(`<Prefix>%s</Prefix>`, xmlEscape(pfx["Prefix"]))))
 		w.Write([]byte(`</CommonPrefixes>`))
 	}
 
@@ -358,9 +378,18 @@ func (c *Client) baseURL() string {
 	return fmt.Sprintf("http://%s:%s", c.config.Host, c.config.Port)
 }
 
+// escapePathSegments escapes each segment of a path for safe URL inclusion
+func escapePathSegments(path string) string {
+	parts := strings.Split(path, "/")
+	for i, part := range parts {
+		parts[i] = url.PathEscape(part)
+	}
+	return strings.Join(parts, "/")
+}
+
 func (c *Client) MakeBucket(uuid string) error {
-	url := fmt.Sprintf("%s/%s", c.baseURL(), uuid)
-	req, err := http.NewRequest(http.MethodPut, url, nil)
+	reqURL := fmt.Sprintf("%s/%s", c.baseURL(), escapePathSegments(uuid))
+	req, err := http.NewRequest(http.MethodPut, reqURL, nil)
 	if err != nil {
 		return err
 	}
@@ -390,8 +419,8 @@ func (c *Client) Put(localPath, remotePath string) error {
 }
 
 func (c *Client) PutReader(r io.Reader, remotePath string) error {
-	url := fmt.Sprintf("%s/%s", c.baseURL(), remotePath)
-	req, err := http.NewRequest(http.MethodPut, url, r)
+	reqURL := fmt.Sprintf("%s/%s", c.baseURL(), escapePathSegments(remotePath))
+	req, err := http.NewRequest(http.MethodPut, reqURL, r)
 	if err != nil {
 		return err
 	}
@@ -415,8 +444,8 @@ func (c *Client) PutBytes(data []byte, remotePath string) error {
 }
 
 func (c *Client) Get(remotePath string) ([]byte, error) {
-	url := fmt.Sprintf("%s/%s", c.baseURL(), remotePath)
-	resp, err := c.client.Get(url)
+	reqURL := fmt.Sprintf("%s/%s", c.baseURL(), escapePathSegments(remotePath))
+	resp, err := c.client.Get(reqURL)
 	if err != nil {
 		return nil, err
 	}
@@ -444,8 +473,8 @@ func (c *Client) GetToFile(remotePath, localPath string) error {
 }
 
 func (c *Client) Delete(remotePath string) error {
-	url := fmt.Sprintf("%s/%s", c.baseURL(), remotePath)
-	req, err := http.NewRequest(http.MethodDelete, url, nil)
+	reqURL := fmt.Sprintf("%s/%s", c.baseURL(), escapePathSegments(remotePath))
+	req, err := http.NewRequest(http.MethodDelete, reqURL, nil)
 	if err != nil {
 		return err
 	}
@@ -465,8 +494,8 @@ func (c *Client) Delete(remotePath string) error {
 }
 
 func (c *Client) Head(remotePath string) (*FileInfo, error) {
-	url := fmt.Sprintf("%s/%s", c.baseURL(), remotePath)
-	req, err := http.NewRequest(http.MethodHead, url, nil)
+	reqURL := fmt.Sprintf("%s/%s", c.baseURL(), escapePathSegments(remotePath))
+	req, err := http.NewRequest(http.MethodHead, reqURL, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -511,8 +540,8 @@ func (c *Client) List(bucketPath string) ([]FileInfo, error) {
 		bucketPath += "/"
 	}
 
-	url := fmt.Sprintf("%s/%s?list-type=2", c.baseURL(), bucketPath)
-	resp, err := c.client.Get(url)
+	reqURL := fmt.Sprintf("%s/%s?list-type=2", c.baseURL(), escapePathSegments(bucketPath))
+	resp, err := c.client.Get(reqURL)
 	if err != nil {
 		return nil, err
 	}
