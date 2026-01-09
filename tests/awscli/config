@@ -1,0 +1,6 @@
+[default]
+region = us-east-1
+output = json
+s3 =
+    signature_version = s3v4
+    addressing_style = path
