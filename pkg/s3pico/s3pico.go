@@ -45,8 +45,9 @@ type Server struct {
 }
 
 type Client struct {
-	config ClientConfig
-	client *http.Client
+	config          ClientConfig
+	client          *http.Client
+	baseURLOverride string
 }
 
 type responseWriter struct {
@@ -374,7 +375,15 @@ func NewClient(config ClientConfig) *Client {
 	}
 }
 
+// SetBaseURL overrides the computed base URL (useful with httptest.NewServer).
+func (c *Client) SetBaseURL(u string) {
+	c.baseURLOverride = strings.TrimRight(u, "/")
+}
+
 func (c *Client) baseURL() string {
+	if c.baseURLOverride != "" {
+		return c.baseURLOverride
+	}
 	return fmt.Sprintf("http://%s:%s", c.config.Host, c.config.Port)
 }
 
