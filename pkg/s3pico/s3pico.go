@@ -1,6 +1,9 @@
 package s3pico
 
 import (
+	"crypto/md5"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/xml"
 	"fmt"
 	"io"
@@ -8,7 +11,10 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -42,6 +48,16 @@ type ClientConfig struct {
 type Server struct {
 	config     ServerConfig
 	httpServer *http.Server
+
+	// multipart upload tracking
+	mu       sync.Mutex
+	uploads  map[string]*multipartUpload // uploadId -> upload metadata
+}
+
+type multipartUpload struct {
+	bucket string
+	key    string
+	partsDir string
 }
 
 type Client struct {
@@ -78,7 +94,7 @@ func NewServer(config ServerConfig) (*Server, error) {
 		return nil, fmt.Errorf("failed to create data directory: %w", err)
 	}
 
-	return &Server{config: config}, nil
+	return &Server{config: config, uploads: make(map[string]*multipartUpload)}, nil
 }
 
 func (s *Server) Handler() http.Handler {
@@ -166,11 +182,25 @@ func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPut:
 		if subPath == "" {
 			s.handleCreateBucket(wrappedWriter, r, projectDir, uuid)
+		} else if r.URL.Query().Get("partNumber") != "" && r.URL.Query().Get("uploadId") != "" {
+			s.handleUploadPart(wrappedWriter, r)
 		} else {
 			s.handlePut(wrappedWriter, r, fullPath)
 		}
+	case http.MethodPost:
+		if r.URL.Query().Has("uploads") {
+			s.handleCreateMultipartUpload(wrappedWriter, r, fullPath, uuid, subPath)
+		} else if r.URL.Query().Get("uploadId") != "" {
+			s.handleCompleteMultipartUpload(wrappedWriter, r, fullPath)
+		} else {
+			http.Error(wrappedWriter, "Method not allowed", http.StatusMethodNotAllowed)
+		}
 	case http.MethodDelete:
-		s.handleDelete(wrappedWriter, r, fullPath)
+		if r.URL.Query().Get("uploadId") != "" {
+			s.handleAbortMultipartUpload(wrappedWriter, r)
+		} else {
+			s.handleDelete(wrappedWriter, r, fullPath)
+		}
 	case http.MethodHead:
 		s.handleHead(wrappedWriter, r, fullPath)
 	default:
@@ -343,6 +373,170 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request, fullPath s
 		return
 	}
 
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleCreateMultipartUpload(w http.ResponseWriter, r *http.Request, fullPath, bucket, key string) {
+	var buf [16]byte
+	if _, err := rand.Read(buf[:]); err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	uploadID := hex.EncodeToString(buf[:])
+
+	partsDir := filepath.Join(s.config.DataDir, ".multipart", uploadID)
+	if err := os.MkdirAll(partsDir, 0755); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	s.mu.Lock()
+	s.uploads[uploadID] = &multipartUpload{
+		bucket:   bucket,
+		key:      key,
+		partsDir: partsDir,
+	}
+	s.mu.Unlock()
+
+	w.Header().Set("Content-Type", "application/xml")
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?>`)
+	fmt.Fprintf(w, `<InitiateMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">`)
+	fmt.Fprintf(w, `<Bucket>%s</Bucket>`, xmlEscape(bucket))
+	fmt.Fprintf(w, `<Key>%s</Key>`, xmlEscape(key))
+	fmt.Fprintf(w, `<UploadId>%s</UploadId>`, xmlEscape(uploadID))
+	fmt.Fprintf(w, `</InitiateMultipartUploadResult>`)
+}
+
+func (s *Server) handleUploadPart(w http.ResponseWriter, r *http.Request) {
+	uploadID := r.URL.Query().Get("uploadId")
+	partNumStr := r.URL.Query().Get("partNumber")
+	partNum, err := strconv.Atoi(partNumStr)
+	if err != nil || partNum < 1 {
+		http.Error(w, "Invalid partNumber", http.StatusBadRequest)
+		return
+	}
+
+	s.mu.Lock()
+	upload, ok := s.uploads[uploadID]
+	s.mu.Unlock()
+	if !ok {
+		http.Error(w, "Upload not found", http.StatusNotFound)
+		return
+	}
+
+	partPath := filepath.Join(upload.partsDir, fmt.Sprintf("part-%05d", partNum))
+	f, err := os.Create(partPath)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	hasher := md5.New()
+	written, err := io.Copy(io.MultiWriter(f, hasher), r.Body)
+	f.Close()
+	if err != nil {
+		os.Remove(partPath)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	etag := fmt.Sprintf(`"%s"`, hex.EncodeToString(hasher.Sum(nil)))
+	w.Header().Set("ETag", etag)
+
+	if s.config.Debug {
+		fmt.Printf("[DEBUG] UploadPart uploadId=%s part=%d size=%d etag=%s\n", uploadID, partNum, written, etag)
+	}
+
+	w.WriteHeader(http.StatusOK)
+}
+
+func (s *Server) handleCompleteMultipartUpload(w http.ResponseWriter, r *http.Request, fullPath string) {
+	uploadID := r.URL.Query().Get("uploadId")
+
+	s.mu.Lock()
+	upload, ok := s.uploads[uploadID]
+	s.mu.Unlock()
+	if !ok {
+		http.Error(w, "Upload not found", http.StatusNotFound)
+		return
+	}
+
+	// Read and discard the XML body (we don't need to validate part ETags)
+	io.ReadAll(r.Body)
+
+	// List part files and sort them
+	entries, err := os.ReadDir(upload.partsDir)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].Name() < entries[j].Name()
+	})
+
+	// Concatenate parts into final file
+	dir := filepath.Dir(fullPath)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	outFile, err := os.Create(fullPath)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	hasher := md5.New()
+	for _, entry := range entries {
+		partPath := filepath.Join(upload.partsDir, entry.Name())
+		pf, err := os.Open(partPath)
+		if err != nil {
+			outFile.Close()
+			os.Remove(fullPath)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		io.Copy(io.MultiWriter(outFile, hasher), pf)
+		pf.Close()
+	}
+	outFile.Close()
+
+	// Clean up parts
+	os.RemoveAll(upload.partsDir)
+	s.mu.Lock()
+	delete(s.uploads, uploadID)
+	s.mu.Unlock()
+
+	etag := fmt.Sprintf(`"%s"`, hex.EncodeToString(hasher.Sum(nil)))
+
+	w.Header().Set("Content-Type", "application/xml")
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?>`)
+	fmt.Fprintf(w, `<CompleteMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">`)
+	fmt.Fprintf(w, `<Bucket>%s</Bucket>`, xmlEscape(upload.bucket))
+	fmt.Fprintf(w, `<Key>%s</Key>`, xmlEscape(upload.key))
+	fmt.Fprintf(w, `<ETag>%s</ETag>`, xmlEscape(etag))
+	fmt.Fprintf(w, `</CompleteMultipartUploadResult>`)
+}
+
+func (s *Server) handleAbortMultipartUpload(w http.ResponseWriter, r *http.Request) {
+	uploadID := r.URL.Query().Get("uploadId")
+
+	s.mu.Lock()
+	upload, ok := s.uploads[uploadID]
+	if ok {
+		delete(s.uploads, uploadID)
+	}
+	s.mu.Unlock()
+
+	if !ok {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	os.RemoveAll(upload.partsDir)
 	w.WriteHeader(http.StatusNoContent)
 }
 
